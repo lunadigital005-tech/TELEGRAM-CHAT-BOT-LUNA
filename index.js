@@ -1,4 +1,5 @@
 import "dotenv/config";
+import express from "express";
 import { Bot, GrammyError, HttpError } from "grammy";
 import { GoogleGenAI } from "@google/genai";
 import {
@@ -19,6 +20,7 @@ import {
 // =====================================================
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ? process.env.TELEGRAM_BOT_TOKEN.trim() : "";
 const GEMINI_KEY = process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.trim() : "";
+const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN || BOT_TOKEN === "your_telegram_bot_token_here") {
   console.error("❌ ERROR: TELEGRAM_BOT_TOKEN is missing or not configured in .env file.");
@@ -34,7 +36,36 @@ console.log(`[INIT] Loaded BOT_TOKEN (${BOT_TOKEN.length} chars)`);
 console.log(`[INIT] Loaded GEMINI_API_KEY (${GEMINI_KEY.length} chars, starts with ${GEMINI_KEY.slice(0, 5)}...)`);
 
 // =====================================================
-// 2. CLIENT & CONSTANTS SETUP
+// 2. LIGHTWEIGHT EXPRESS HTTP SERVER (RENDER REQUIREMENT)
+// =====================================================
+const app = express();
+app.use(express.json());
+
+// GET /health endpoint returning exact service status
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "online",
+    service: "Luna Digitals Telegram Bot"
+  });
+});
+
+// Root endpoint for simple ping/status checks
+app.get("/", (req, res) => {
+  res.status(200).json({
+    message: `${COMPANY_NAME} Telegram Bot Service is running.`,
+    uptime: Math.floor(process.uptime()),
+    healthCheck: "/health"
+  });
+});
+
+// Start Express HTTP server binding to process.env.PORT
+const server = app.listen(PORT, () => {
+  console.log(`🌐 Express HTTP server listening on port ${PORT}`);
+  console.log(`🩺 Health check available at http://localhost:${PORT}/health`);
+});
+
+// =====================================================
+// 3. TELEGRAM BOT & GEMINI SETUP
 // =====================================================
 const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
 const bot = new Bot(BOT_TOKEN);
@@ -51,7 +82,7 @@ const MAX_HISTORY_TURNS = 6;
 // In-memory conversation state: Map<userId, Array<{ role: 'user' | 'model', parts: [{ text: string }] }>>
 const conversationSessions = new Map();
 
-// In-flight user request tracker to prevent race conditions or duplicate sends
+// In-flight user request tracker to prevent duplicate concurrent sends
 const activeRequests = new Set();
 
 // Comprehensive Gemini system prompt combining guidelines with structured facts
@@ -66,7 +97,7 @@ ${COMPANY_KNOWLEDGE}
 `.trim();
 
 // =====================================================
-// 3. UTILITY FUNCTIONS
+// 4. UTILITY FUNCTIONS
 // =====================================================
 
 /**
@@ -148,7 +179,7 @@ function getPredefinedFallbackResponse(userQuery) {
 }
 
 // =====================================================
-// 4. LEAN GEMINI CALL WITH STRICT TIMEOUT
+// 5. LEAN GEMINI CALL WITH STRICT TIMEOUT
 // =====================================================
 
 /**
@@ -159,7 +190,6 @@ function getPredefinedFallbackResponse(userQuery) {
  * @returns {Promise<string>}
  */
 async function callGeminiLean(userText, userHistory = []) {
-  // Use verified working models only (gemini-3.5-flash-lite, fallback gemini-3.8-flash)
   const candidateModels = ["gemini-3.5-flash-lite", "gemini-3.8-flash"];
 
   const contents = [
@@ -203,11 +233,9 @@ async function callGeminiLean(userText, userHistory = []) {
       const status = err.status || err.statusCode;
       console.warn(`[GEMINI WARNING] Model ${model} failed (status: ${status || "timeout"}): ${err.message?.slice(0, 100)}`);
 
-      // If quota exceeded (429) or model deprecated (404), do NOT retry — exit immediately
       if (status === 429 || status === 404) {
         throw err;
       }
-      // If 503 and another model is available, loop to next model once
     }
   }
 
@@ -215,7 +243,7 @@ async function callGeminiLean(userText, userHistory = []) {
 }
 
 // =====================================================
-// 5. TELEGRAM COMMANDS
+// 6. TELEGRAM COMMANDS
 // =====================================================
 
 bot.command("start", async (ctx) => {
@@ -275,7 +303,7 @@ bot.command("clear", async (ctx) => {
 });
 
 // =====================================================
-// 6. MAIN MESSAGE HANDLER (INSTANT + LEAN AI PIPELINE)
+// 7. MAIN MESSAGE HANDLER (INSTANT + LEAN AI PIPELINE)
 // =====================================================
 
 bot.on("message:text", async (ctx) => {
@@ -298,7 +326,6 @@ bot.on("message:text", async (ctx) => {
   console.log(`[INCOMING] From: ${userName} (ID: ${userId})`);
   console.log(`[QUERY]: "${userQuery}"`);
 
-  // Ensure conversation history structure exists
   if (!conversationSessions.has(userId)) {
     conversationSessions.set(userId, []);
   }
@@ -314,11 +341,9 @@ bot.on("message:text", async (ctx) => {
       const elapsed = Date.now() - startTime;
       console.log(`[INSTANT MATCH] Resolved in ${elapsed}ms without calling external API!`);
 
-      // Send typing indicator and immediately dispatch instant answer
       await ctx.replyWithChatAction("typing");
       await sendSafeMessage(ctx, instantAnswer);
 
-      // Record in conversation history for context continuity
       userHistory.push({ role: "user", parts: [{ text: userQuery }] });
       userHistory.push({ role: "model", parts: [{ text: instantAnswer }] });
       if (userHistory.length > MAX_HISTORY_TURNS * 2) {
@@ -345,10 +370,8 @@ bot.on("message:text", async (ctx) => {
       finalReply = getPredefinedFallbackResponse(userQuery);
     }
 
-    // Deliver response
     await sendSafeMessage(ctx, finalReply);
 
-    // Save history
     userHistory.push({ role: "user", parts: [{ text: userQuery }] });
     userHistory.push({ role: "model", parts: [{ text: finalReply }] });
     if (userHistory.length > MAX_HISTORY_TURNS * 2) {
@@ -370,7 +393,7 @@ bot.on("message:text", async (ctx) => {
 });
 
 // =====================================================
-// 7. GLOBAL GRAMMY ERROR HANDLER
+// 8. GLOBAL GRAMMY ERROR HANDLER
 // =====================================================
 
 bot.catch((err) => {
@@ -387,24 +410,45 @@ bot.catch((err) => {
 });
 
 // =====================================================
-// 8. START BOT & SHUTDOWN HANDLING
+// 9. START BOT & GRACEFUL SHUTDOWN HANDLING
 // =====================================================
 
 console.log("=========================================");
 console.log(`🤖 Starting ${COMPANY_NAME} Telegram Bot...`);
 console.log("=========================================");
 
+// Start Telegram polling with conflict protection
 bot.start({
   onStart: (botInfo) => {
-    console.log(`✅ Bot successfully started! Running as @${botInfo.username}`);
+    console.log(`✅ Telegram Bot successfully started! Running as @${botInfo.username}`);
     console.log("Listening for incoming messages and commands...");
   },
+}).catch((err) => {
+  // If another instance is running locally or elsewhere, prevent app crash
+  if (err?.error_code === 409 || err?.message?.includes("409")) {
+    console.warn("⚠️ [POLLING CONFLICT] Another instance of the bot is already polling Telegram.");
+    console.warn("HTTP server remains healthy and active on port " + PORT);
+  } else {
+    console.error("❌ Telegram bot polling error:", err);
+  }
 });
 
+// Graceful shutdown stopping both HTTP server and Telegram bot
 const shutdown = (signal) => {
-  console.log(`\n🛑 Received ${signal}. Shutting down bot gracefully...`);
-  bot.stop();
-  process.exit(0);
+  console.log(`\n🛑 Received ${signal}. Shutting down gracefully...`);
+  try {
+    bot.stop();
+  } catch (err) {
+    console.warn("Notice: Bot already stopped:", err.message);
+  }
+
+  server.close(() => {
+    console.log("🌐 Express HTTP server closed.");
+    process.exit(0);
+  });
+
+  // Force exit after 5 seconds if lingering sockets exist
+  setTimeout(() => process.exit(0), 5000);
 };
 
 process.once("SIGINT", () => shutdown("SIGINT"));
